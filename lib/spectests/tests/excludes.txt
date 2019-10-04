@@ -33,7 +33,6 @@ clif:fail:linking.wast:147 # AssertTrap - expected trap, got Runtime:Error "unkn
 clif:fail:linking.wast:149 # AssertTrap - expected trap, got Runtime:Error "unknown trap at 0x106883037 - illegal instruction"
 clif:fail:linking.wast:185 # AssertTrap - expected trap, got Runtime:Error "unknown trap at 0x106883062 - illegal instruction"
 clif:fail:linking.wast:187 # AssertTrap - expected trap, got Runtime:Error "unknown trap at 0x106883062 - illegal instruction"
-clif:fail:linking.wast:387 # AssertReturn - result I32(0) ("0x0") does not match expected I32(104) ("0x68")
 clif:fail:linking.wast:388 # AssertReturn - Call failed RuntimeError: WebAssembly trap occurred during runtime: `call_indirect` out-of-bounds
 
 # clif:skip:skip-stack-guard-page.wast:2 # Slow test
@@ -833,7 +832,6 @@ llvm:fail:i32.wast:243 # AssertReturn - result I32(283816271) ("0x10eab14f") doe
 llvm:fail:i32.wast:252 # AssertReturn - result I32(283816288) ("0x10eab160") does not match expected I32(32) ("0x20")
 llvm:fail:i64.wast:243 # AssertReturn - result I64(4578783727) ("0x110eab1ef") does not match expected I64(64) ("0x40")
 llvm:fail:i64.wast:252 # AssertReturn - result I64(4578783712) ("0x110eab1e0") does not match expected I64(64) ("0x40")
-llvm:fail:linking.wast:387 # AssertReturn - result I32(0) ("0x0") does not match expected I32(104) ("0x68")
 llvm:fail:linking.wast:388 # AssertReturn - Call failed RuntimeError: WebAssembly trap occurred during runtime: incorrect `call_indirect` signature
 llvm:fail:load.wast:201 # AssertReturn - result I32(285315103) ("0x1101901f") does not match expected I32(32) ("0x20")
 
@@ -1540,7 +1538,6 @@ singlepass:fail:linking.wast:190 # AssertTrap - expected trap, got Runtime:Error
 singlepass:fail:linking.wast:225 # AssertTrap - expected trap, got Runtime:Error unknown error
 singlepass:fail:linking.wast:236 # AssertTrap - expected trap, got Runtime:Error unknown error
 singlepass:fail:linking.wast:248 # AssertTrap - expected trap, got Runtime:Error unknown error
-singlepass:fail:linking.wast:387 # AssertReturn - result I32(0) ("0x0") does not match expected I32(104) ("0x68")
 singlepass:fail:linking.wast:388 # AssertReturn - Call failed RuntimeError: unknown error
 singlepass:fail:load.wast:201 # AssertReturn - result I32(0) ("0x0") does not match expected I32(32) ("0x20")
 singlepass:fail:memory_grow.wast:15 # AssertTrap - expected trap, got Runtime:Error unknown error
