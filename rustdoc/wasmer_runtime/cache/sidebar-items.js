@@ -1,1 +1,0 @@
-initSidebarItems({"enum":[["Backend",""]],"struct":[["Artifact",""],["FileSystemCache","Representation of a directory that contains compiled wasm artifacts."],["WasmHash","The hash of a wasm module."]],"trait":[["Cache","A generic cache for storing and loading compiled wasm modules."]]});

@@ -1,1 +1,0 @@
-initSidebarItems({"struct":[["CodeMemory",""],["LocalInstance",""],["LocalLoader",""]],"trait":[["Instance",""],["Loader",""]]});

@@ -1,1 +1,0 @@
-initSidebarItems({"static":[["GLOBAL_OPTIONS",""]],"struct":[["FunctionCodeGenerator",""],["LLVMOptions","LLVM backend flags."],["ModuleCodeGenerator",""]],"type":[["LLVMCompiler",""]]});

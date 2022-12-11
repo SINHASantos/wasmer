@@ -1,1 +1,0 @@
-initSidebarItems({"fn":[["is_wasm_binary","Detect if a provided binary is a Wasm file"]]});

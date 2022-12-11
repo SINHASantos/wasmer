@@ -1,1 +1,0 @@
-initSidebarItems({"struct":[["BoxedMap",""],["Iter",""],["IterMut",""],["Map","Dense item map"],["SliceMap","This is a dynamically-sized slice that can only be indexed by the correct index type."]],"trait":[["TypedIndex",""]]});
