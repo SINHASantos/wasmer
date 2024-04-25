@@ -11,7 +11,7 @@
 use std::convert::TryInto;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use wasmer::wasmparser::{Operator, Type as WpType, TypeOrFuncType as WpTypeOrFuncType};
+use wasmer::wasmparser::{BlockType as WpTypeOrFuncType, Operator};
 use wasmer::{
     AsStoreMut, ExportIndex, FunctionMiddleware, GlobalInit, GlobalType, Instance,
     LocalFunctionIndex, MiddlewareError, MiddlewareReaderState, ModuleMiddleware, Mutability, Type,
@@ -234,7 +234,7 @@ impl<F: Fn(&Operator) -> u64 + Send + Sync> FunctionMiddleware for FunctionMeter
                         Operator::GlobalGet { global_index: self.global_indexes.remaining_points().as_u32() },
                         Operator::I64Const { value: self.accumulated_cost as i64 },
                         Operator::I64LtU,
-                        Operator::If { ty: WpTypeOrFuncType::Type(WpType::EmptyBlockType) },
+                        Operator::If { blockty: WpTypeOrFuncType::Empty },
                         Operator::I32Const { value: 1 },
                         Operator::GlobalSet { global_index: self.global_indexes.points_exhausted().as_u32() },
                         Operator::Unreachable,
@@ -353,9 +353,8 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
-    use wasmer::{
-        imports, wat2wasm, CompilerConfig, Cranelift, EngineBuilder, Module, Store, TypedFunction,
-    };
+    use wasmer::sys::EngineBuilder;
+    use wasmer::{imports, wat2wasm, CompilerConfig, Cranelift, Module, Store, TypedFunction};
 
     fn cost_function(operator: &Operator) -> u64 {
         match operator {

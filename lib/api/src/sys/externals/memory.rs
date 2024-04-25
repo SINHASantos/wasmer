@@ -1,57 +1,32 @@
-use crate::sys::exports::{ExportError, Exportable};
-use crate::sys::externals::Extern;
-use crate::sys::store::{AsStoreMut, AsStoreRef};
-use crate::sys::MemoryType;
-use crate::MemoryAccessError;
-use std::convert::TryInto;
-use std::marker::PhantomData;
-use std::mem;
-use std::mem::MaybeUninit;
-use std::slice;
-#[cfg(feature = "tracing")]
+use std::{
+    convert::TryInto,
+    marker::PhantomData,
+    mem::{self, MaybeUninit},
+    slice,
+};
+
 use tracing::warn;
 use wasmer_types::Pages;
-use wasmer_vm::{InternalStoreHandle, LinearMemory, MemoryError, StoreHandle, VMExtern, VMMemory};
+use wasmer_vm::{
+    LinearMemory, MemoryError, StoreHandle, ThreadConditionsHandle, VMExtern, VMMemory,
+};
 
-use super::MemoryView;
+use crate::{
+    store::{AsStoreMut, AsStoreRef},
+    sys::{engine::NativeEngineExt, externals::memory_view::MemoryView},
+    vm::VMExternMemory,
+    MemoryAccessError, MemoryType,
+};
 
-/// A WebAssembly `memory` instance.
-///
-/// A memory instance is the runtime representation of a linear memory.
-/// It consists of a vector of bytes and an optional maximum size.
-///
-/// The length of the vector always is a multiple of the WebAssembly
-/// page size, which is defined to be the constant 65536 – abbreviated 64Ki.
-/// Like in a memory type, the maximum size in a memory instance is
-/// given in units of this page size.
-///
-/// A memory created by the host or in WebAssembly code will be accessible and
-/// mutable from both host and WebAssembly.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#memory-instances>
 #[derive(Debug, Clone)]
 pub struct Memory {
     pub(crate) handle: StoreHandle<VMMemory>,
 }
 
 impl Memory {
-    #[cfg(feature = "compiler")]
-    /// Creates a new host `Memory` from the provided [`MemoryType`].
-    ///
-    /// This function will construct the `Memory` using the store
-    /// [`BaseTunables`][crate::sys::BaseTunables].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
-    /// # let mut store = Store::default();
-    /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
-    /// ```
     pub fn new(store: &mut impl AsStoreMut, ty: MemoryType) -> Result<Self, MemoryError> {
         let mut store = store.as_store_mut();
-        let tunables = store.tunables();
+        let tunables = store.engine().tunables();
         let style = tunables.memory_style(&ty);
         let memory = tunables.create_host_memory(&ty, &style)?;
 
@@ -60,67 +35,15 @@ impl Memory {
         })
     }
 
-    /// Create a memory object from an existing memory and attaches it to the store
     pub fn new_from_existing(new_store: &mut impl AsStoreMut, memory: VMMemory) -> Self {
         let handle = StoreHandle::new(new_store.objects_mut(), memory);
         Self::from_vm_extern(new_store, handle.internal_handle())
     }
 
-    /// Returns the [`MemoryType`] of the `Memory`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
-    /// # let mut store = Store::default();
-    /// #
-    /// let mt = MemoryType::new(1, None, false);
-    /// let m = Memory::new(&mut store, mt).unwrap();
-    ///
-    /// assert_eq!(m.ty(&mut store), mt);
-    /// ```
     pub fn ty(&self, store: &impl AsStoreRef) -> MemoryType {
         self.handle.get(store.as_store_ref().objects()).ty()
     }
 
-    /// Creates a view into the memory that then allows for
-    /// read and write
-    pub fn view<'a>(&'a self, store: &impl AsStoreRef) -> MemoryView<'a> {
-        MemoryView::new(self, store)
-    }
-
-    /// Grow memory by the specified amount of WebAssembly [`Pages`] and return
-    /// the previous memory size.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value, WASM_MAX_PAGES};
-    /// # let mut store = Store::default();
-    /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, Some(3), false)).unwrap();
-    /// let p = m.grow(&mut store, 2).unwrap();
-    ///
-    /// assert_eq!(p, Pages(1));
-    /// assert_eq!(m.view(&mut store).size(), Pages(3));
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if memory can't be grown by the specified amount
-    /// of pages.
-    ///
-    /// ```should_panic
-    /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value, WASM_MAX_PAGES};
-    /// # use wasmer::FunctionEnv;
-    /// # let mut store = Store::default();
-    /// # let env = FunctionEnv::new(&mut store, ());
-    /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, Some(1), false)).unwrap();
-    ///
-    /// // This results in an error: `MemoryError::CouldNotGrow`.
-    /// let s = m.grow(&mut store, 1).unwrap();
-    /// ```
     pub fn grow<IntoPages>(
         &self,
         store: &mut impl AsStoreMut,
@@ -132,43 +55,25 @@ impl Memory {
         self.handle.get_mut(store.objects_mut()).grow(delta.into())
     }
 
-    /// Copies the memory to a new store and returns a memory reference to it
-    #[cfg(feature = "compiler")]
-    pub fn copy_to_store(
+    pub fn grow_at_least(
         &self,
-        store: &impl AsStoreRef,
-        new_store: &mut impl AsStoreMut,
-    ) -> Result<Self, MemoryError> {
-        // Create the new memory using the parameters of the existing memory
-        let view = self.view(store);
-        let ty = self.ty(store);
-        let amount = view.data_size() as usize;
-
-        let new_memory = Self::new(new_store, ty)?;
-        let mut new_view = new_memory.view(&new_store);
-        let new_view_size = new_view.data_size() as usize;
-        if amount > new_view_size {
-            let delta = amount - new_view_size;
-            let pages = ((delta - 1) / wasmer_types::WASM_PAGE_SIZE) + 1;
-            new_memory.grow(new_store, Pages(pages as u32))?;
-            new_view = new_memory.view(&new_store);
-        }
-
-        // Copy the bytes
-        view.copy_to_memory(amount as u64, &new_view)
-            .map_err(|err| MemoryError::Generic(err.to_string()))?;
-
-        // Return the new memory
-        Ok(new_memory)
+        store: &mut impl AsStoreMut,
+        min_size: u64,
+    ) -> Result<(), MemoryError> {
+        self.handle
+            .get_mut(store.objects_mut())
+            .grow_at_least(min_size)
     }
 
-    pub(crate) fn from_vm_extern(
-        store: &impl AsStoreRef,
-        internal: InternalStoreHandle<VMMemory>,
-    ) -> Self {
+    pub fn reset(&self, store: &mut impl AsStoreMut) -> Result<(), MemoryError> {
+        self.handle.get_mut(store.objects_mut()).reset()?;
+        Ok(())
+    }
+
+    pub(crate) fn from_vm_extern(store: &impl AsStoreRef, vm_extern: VMExternMemory) -> Self {
         Self {
             handle: unsafe {
-                StoreHandle::from_internal(store.as_store_ref().objects().id(), internal)
+                StoreHandle::from_internal(store.as_store_ref().objects().id(), vm_extern)
             },
         }
     }
@@ -178,15 +83,88 @@ impl Memory {
         self.handle.store_id() == store.as_store_ref().objects().id()
     }
 
-    /// Attempts to clone this memory (if its clonable)
-    pub fn try_clone(&self, store: &impl AsStoreRef) -> Option<VMMemory> {
+    /// Cloning memory will create another reference to the same memory that
+    /// can be put into a new store
+    pub fn try_clone(&self, store: &impl AsStoreRef) -> Result<VMMemory, MemoryError> {
         let mem = self.handle.get(store.as_store_ref().objects());
-        mem.try_clone().map(|mem| mem.into())
+        let cloned = mem.try_clone()?;
+        Ok(cloned.into())
+    }
+
+    /// Copying the memory will actually copy all the bytes in the memory to
+    /// a identical byte copy of the original that can be put into a new store
+    pub fn try_copy(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Result<Box<dyn LinearMemory + 'static>, MemoryError> {
+        let mut mem = self.try_clone(store)?;
+        mem.copy()
+    }
+
+    pub fn as_shared(&self, store: &impl AsStoreRef) -> Option<crate::SharedMemory> {
+        let mem = self.handle.get(store.as_store_ref().objects());
+        let conds = mem.thread_conditions()?.downgrade();
+
+        Some(crate::SharedMemory::new(crate::Memory(self.clone()), conds))
     }
 
     /// To `VMExtern`.
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
         VMExtern::Memory(self.handle.internal_handle())
+    }
+}
+
+impl crate::externals::memory::SharedMemoryOps for ThreadConditionsHandle {
+    fn notify(
+        &self,
+        dst: crate::externals::memory::MemoryLocation,
+        count: u32,
+    ) -> Result<u32, crate::AtomicsError> {
+        let count = self
+            .upgrade()
+            .ok_or(crate::AtomicsError::Unimplemented)?
+            .do_notify(
+                wasmer_vm::NotifyLocation {
+                    address: dst.address,
+                },
+                count,
+            );
+        Ok(count)
+    }
+
+    fn wait(
+        &self,
+        dst: crate::externals::memory::MemoryLocation,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<u32, crate::AtomicsError> {
+        self.upgrade()
+            .ok_or(crate::AtomicsError::Unimplemented)?
+            .do_wait(
+                wasmer_vm::NotifyLocation {
+                    address: dst.address,
+                },
+                timeout,
+            )
+            .map_err(|e| match e {
+                wasmer_vm::WaiterError::Unimplemented => crate::AtomicsError::Unimplemented,
+                wasmer_vm::WaiterError::TooManyWaiters => crate::AtomicsError::TooManyWaiters,
+                wasmer_vm::WaiterError::AtomicsDisabled => crate::AtomicsError::AtomicsDisabled,
+                _ => crate::AtomicsError::Unimplemented,
+            })
+    }
+
+    fn disable_atomics(&self) -> Result<(), MemoryError> {
+        self.upgrade()
+            .ok_or_else(|| MemoryError::Generic("memory was dropped".to_string()))?
+            .disable_atomics();
+        Ok(())
+    }
+
+    fn wake_all_atomic_waiters(&self) -> Result<(), MemoryError> {
+        self.upgrade()
+            .ok_or_else(|| MemoryError::Generic("memory was dropped".to_string()))?
+            .wake_all_atomic_waiters();
+        Ok(())
     }
 }
 
@@ -197,15 +175,6 @@ impl std::cmp::PartialEq for Memory {
 }
 
 impl std::cmp::Eq for Memory {}
-
-impl<'a> Exportable<'a> for Memory {
-    fn get_self_from_extern(_extern: &'a Extern) -> Result<&'a Self, ExportError> {
-        match _extern {
-            Extern::Memory(memory) => Ok(memory),
-            _ => Err(ExportError::IncompatibleType),
-        }
-    }
-}
 
 /// Underlying buffer for a memory.
 #[derive(Debug, Copy, Clone)]
@@ -221,7 +190,6 @@ impl<'a> MemoryBuffer<'a> {
             .checked_add(buf.len() as u64)
             .ok_or(MemoryAccessError::Overflow)?;
         if end > self.len.try_into().unwrap() {
-            #[cfg(feature = "tracing")]
             warn!(
                 "attempted to read ({} bytes) beyond the bounds of the memory view ({} > {})",
                 buf.len(),
@@ -245,7 +213,6 @@ impl<'a> MemoryBuffer<'a> {
             .checked_add(buf.len() as u64)
             .ok_or(MemoryAccessError::Overflow)?;
         if end > self.len.try_into().unwrap() {
-            #[cfg(feature = "tracing")]
             warn!(
                 "attempted to read ({} bytes) beyond the bounds of the memory view ({} > {})",
                 buf.len(),
@@ -267,7 +234,6 @@ impl<'a> MemoryBuffer<'a> {
             .checked_add(data.len() as u64)
             .ok_or(MemoryAccessError::Overflow)?;
         if end > self.len.try_into().unwrap() {
-            #[cfg(feature = "tracing")]
             warn!(
                 "attempted to write ({} bytes) beyond the bounds of the memory view ({} > {})",
                 data.len(),

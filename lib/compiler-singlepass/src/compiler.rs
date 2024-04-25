@@ -180,7 +180,7 @@ impl Compiler for SinglepassCompiler {
                         generator.finalize(input)
                     }
                     Architecture::Aarch64(_) => {
-                        let machine = MachineARM64::new();
+                        let machine = MachineARM64::new(Some(target.clone()));
                         let mut generator = FuncGen::new(
                             module,
                             &self.config,
@@ -302,7 +302,7 @@ mod tests {
     ) {
         let compile_info = CompileModuleInfo {
             features: Features::new(),
-            module: ModuleInfo::new(),
+            module: Arc::new(ModuleInfo::new()),
             memory_styles: PrimaryMap::<MemoryIndex, MemoryStyle>::new(),
             table_styles: PrimaryMap::<TableIndex, TableStyle>::new(),
         };

@@ -1,17 +1,12 @@
-use crate::js::store::AsStoreRef;
-use crate::js::MemoryAccessError;
-use std::convert::TryInto;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::slice;
-#[cfg(feature = "tracing")]
-use tracing::warn;
+use std::{convert::TryInto, marker::PhantomData, mem::MaybeUninit, ops::Range, slice};
 use wasm_bindgen::JsCast;
-
 use wasmer_types::{Bytes, Pages};
 
-use super::memory::MemoryBuffer;
-use super::Memory;
+use crate::{
+    js::externals::memory::{Memory, MemoryBuffer},
+    mem_access::MemoryAccessError,
+    store::AsStoreRef,
+};
 
 /// A WebAssembly `memory` view.
 ///
@@ -27,7 +22,7 @@ pub struct MemoryView<'a> {
 }
 
 impl<'a> MemoryView<'a> {
-    pub(crate) fn new(memory: &Memory, _store: &impl AsStoreRef) -> Self {
+    pub(crate) fn new(memory: &Memory, _store: &'a (impl AsStoreRef + ?Sized)) -> Self {
         Self::new_raw(&memory.handle.memory)
     }
 
@@ -105,6 +100,7 @@ impl<'a> MemoryView<'a> {
         Bytes(self.size as usize).try_into().unwrap()
     }
 
+    #[inline]
     pub(crate) fn buffer(&self) -> MemoryBuffer<'a> {
         MemoryBuffer {
             base: &self.view as *const _ as *mut _,
@@ -128,8 +124,7 @@ impl<'a> MemoryView<'a> {
             .map_err(|_| MemoryAccessError::Overflow)?;
         let end = offset.checked_add(len).ok_or(MemoryAccessError::Overflow)?;
         if end > view.length() {
-            #[cfg(feature = "tracing")]
-            warn!(
+            tracing::warn!(
                 "attempted to read ({} bytes) beyond the bounds of the memory view ({} > {})",
                 len,
                 end,
@@ -149,8 +144,7 @@ impl<'a> MemoryView<'a> {
         let view = &self.view;
         let offset: u32 = offset.try_into().map_err(|_| MemoryAccessError::Overflow)?;
         if offset >= view.length() {
-            #[cfg(feature = "tracing")]
-            warn!(
+            tracing::warn!(
                 "attempted to read beyond the bounds of the memory view ({} >= {})",
                 offset,
                 view.length()
@@ -170,11 +164,11 @@ impl<'a> MemoryView<'a> {
     ///
     /// This method is guaranteed to be safe (from the host side) in the face of
     /// concurrent writes.
-    pub fn read_uninit(
+    pub fn read_uninit<'b>(
         &self,
         offset: u64,
-        buf: &'a mut [MaybeUninit<u8>],
-    ) -> Result<&'a mut [u8], MemoryAccessError> {
+        buf: &'b mut [MaybeUninit<u8>],
+    ) -> Result<&'b mut [u8], MemoryAccessError> {
         let view = &self.view;
         let offset: u32 = offset.try_into().map_err(|_| MemoryAccessError::Overflow)?;
         let len: u32 = buf
@@ -183,8 +177,7 @@ impl<'a> MemoryView<'a> {
             .map_err(|_| MemoryAccessError::Overflow)?;
         let end = offset.checked_add(len).ok_or(MemoryAccessError::Overflow)?;
         if end > view.length() {
-            #[cfg(feature = "tracing")]
-            warn!(
+            tracing::warn!(
                 "attempted to read ({} bytes) beyond the bounds of the memory view ({} > {})",
                 len,
                 end,
@@ -220,8 +213,7 @@ impl<'a> MemoryView<'a> {
         let view = &self.view;
         let end = offset.checked_add(len).ok_or(MemoryAccessError::Overflow)?;
         if end > view.length() {
-            #[cfg(feature = "tracing")]
-            warn!(
+            tracing::warn!(
                 "attempted to write ({} bytes) beyond the bounds of the memory view ({} > {})",
                 len,
                 end,
@@ -241,8 +233,7 @@ impl<'a> MemoryView<'a> {
         let view = &self.view;
         let offset: u32 = offset.try_into().map_err(|_| MemoryAccessError::Overflow)?;
         if offset >= view.length() {
-            #[cfg(feature = "tracing")]
-            warn!(
+            tracing::warn!(
                 "attempted to write beyond the bounds of the memory view ({} >= {})",
                 offset,
                 view.length()
@@ -254,12 +245,20 @@ impl<'a> MemoryView<'a> {
     }
 
     /// Copies the memory and returns it as a vector of bytes
+    #[allow(unused)]
     pub fn copy_to_vec(&self) -> Result<Vec<u8>, MemoryAccessError> {
+        self.copy_range_to_vec(0..self.data_size())
+    }
+
+    /// Copies a range of the memory and returns it as a vector of bytes
+    #[allow(unused)]
+    pub fn copy_range_to_vec(&self, range: Range<u64>) -> Result<Vec<u8>, MemoryAccessError> {
         let mut new_memory = Vec::new();
-        let mut offset = 0;
+        let mut offset = range.start;
+        let end = range.end.min(self.data_size());
         let mut chunk = [0u8; 40960];
-        while offset < self.data_size() {
-            let remaining = self.data_size() - offset;
+        while offset < end {
+            let remaining = end - offset;
             let sublen = remaining.min(chunk.len() as u64) as usize;
             self.read(offset, &mut chunk[..sublen])?;
             new_memory.extend_from_slice(&chunk[..sublen]);

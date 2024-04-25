@@ -1,20 +1,24 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
 use anyhow::Context;
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use clap::Parser;
-use indexmap::IndexMap;
-use std::collections::HashMap;
-use std::path::Path;
-use std::path::PathBuf;
-use wasmer_registry::WasmerConfig;
+use semver::VersionReq;
+use wasmer_registry::wasmer_env::WasmerEnv;
 
-static NOTE: &str =
-    "# See more keys and definitions at https://docs.wasmer.io/ecosystem/wapm/manifest";
+static NOTE: &str = "# See more keys and definitions at https://docs.wasmer.io/registry/manifest";
 
 const NEWLINE: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
 /// CLI args for the `wasmer init` command
 #[derive(Debug, Parser)]
 pub struct Init {
+    #[clap(flatten)]
+    env: WasmerEnv,
+
     /// Initialize wasmer.toml for a library package
     #[clap(long, group = "crate-type")]
     pub lib: bool,
@@ -137,6 +141,7 @@ impl Init {
             self.template.as_ref(),
             self.include.as_slice(),
             self.quiet,
+            self.env.dir(),
         )?;
 
         if let Some(parent) = target_file.parent() {
@@ -147,21 +152,40 @@ impl Init {
         Self::write_wasmer_toml(&target_file, &constructed_manifest)
     }
 
-    /// Writes the metadata to a wasmer.toml file
+    /// Writes the metadata to a wasmer.toml file, making sure we include the
+    /// [`NOTE`] so people get a link to the registry docs.
     fn write_wasmer_toml(
         path: &PathBuf,
-        toml: &wasmer_toml::Manifest,
+        toml: &wasmer_config::package::Manifest,
     ) -> Result<(), anyhow::Error> {
-        let toml_string = toml::to_string_pretty(&toml)?
-            .replace(
-                "[dependencies]",
-                &format!("{NOTE}{NEWLINE}{NEWLINE}[dependencies]"),
-            )
-            .lines()
-            .collect::<Vec<_>>()
-            .join(NEWLINE);
+        let toml_string = toml::to_string_pretty(&toml)?;
 
-        std::fs::write(&path, &toml_string)
+        let mut resulting_string = String::new();
+        let mut note_inserted = false;
+
+        for line in toml_string.lines() {
+            resulting_string.push_str(line);
+
+            if !note_inserted && line.is_empty() {
+                // We've found an empty line after the initial [package]
+                // section. Let's add our note here.
+                resulting_string.push_str(NEWLINE);
+                resulting_string.push_str(NOTE);
+                resulting_string.push_str(NEWLINE);
+                note_inserted = true;
+            }
+            resulting_string.push_str(NEWLINE);
+        }
+
+        if !note_inserted {
+            // Make sure the note still ends up at the end of the file.
+            resulting_string.push_str(NEWLINE);
+            resulting_string.push_str(NOTE);
+            resulting_string.push_str(NEWLINE);
+            resulting_string.push_str(NEWLINE);
+        }
+
+        std::fs::write(path, resulting_string)
             .with_context(|| format!("Unable to write to \"{}\"", path.display()))?;
 
         Ok(())
@@ -205,60 +229,51 @@ impl Init {
         }
     }
 
-    fn get_filesystem_mapping(include: &[String]) -> Option<IndexMap<String, PathBuf>> {
-        if include.is_empty() {
-            return None;
-        }
+    fn get_filesystem_mapping(include: &[String]) -> impl Iterator<Item = (String, PathBuf)> + '_ {
+        include.iter().map(|path| {
+            if path == "." || path == "/" {
+                return ("/".to_string(), Path::new("/").to_path_buf());
+            }
 
-        Some(
-            include
-                .iter()
-                .map(|path| {
-                    if path == "." || path == "/" {
-                        return ("/".to_string(), Path::new("/").to_path_buf());
-                    }
+            let key = format!("./{path}");
+            let value = PathBuf::from(format!("/{path}"));
 
-                    let key = format!("./{path}");
-                    let value = PathBuf::from(format!("/{path}"));
-
-                    (key, value)
-                })
-                .collect(),
-        )
+            (key, value)
+        })
     }
 
     fn get_command(
-        modules: &[wasmer_toml::Module],
+        modules: &[wasmer_config::package::Module],
         bin_or_lib: BinOrLib,
-    ) -> Option<Vec<wasmer_toml::Command>> {
+    ) -> Vec<wasmer_config::package::Command> {
         match bin_or_lib {
-            BinOrLib::Bin => Some(
-                modules
-                    .iter()
-                    .map(|m| {
-                        wasmer_toml::Command::V1(wasmer_toml::CommandV1 {
-                            name: m.name.clone(),
+            BinOrLib::Bin => modules
+                .iter()
+                .map(|m| {
+                    wasmer_config::package::Command::V2(wasmer_config::package::CommandV2 {
+                        name: m.name.clone(),
+                        module: wasmer_config::package::ModuleReference::CurrentPackage {
                             module: m.name.clone(),
-                            main_args: None,
-                            package: None,
-                        })
+                        },
+                        runner: "wasi".to_string(),
+                        annotations: None,
                     })
-                    .collect(),
-            ),
-            BinOrLib::Lib | BinOrLib::Empty => None,
+                })
+                .collect(),
+            BinOrLib::Lib | BinOrLib::Empty => Vec::new(),
         }
     }
 
     /// Returns the dependencies based on the `--template` flag
-    fn get_dependencies(template: Option<&Template>) -> HashMap<String, String> {
+    fn get_dependencies(template: Option<&Template>) -> HashMap<String, VersionReq> {
         let mut map = HashMap::default();
 
         match template {
             Some(Template::Js) => {
-                map.insert("quickjs".to_string(), "quickjs/quickjs@latest".to_string());
+                map.insert("quickjs/quickjs".to_string(), VersionReq::STAR);
             }
             Some(Template::Python) => {
-                map.insert("python".to_string(), "python/python@latest".to_string());
+                map.insert("python/python".to_string(), VersionReq::STAR);
             }
             _ => {}
         }
@@ -293,16 +308,20 @@ impl Init {
                         let is_wit = e.path().extension().and_then(|s| s.to_str()) == Some(".wit");
                         let is_wai = e.path().extension().and_then(|s| s.to_str()) == Some(".wai");
                         if is_wit {
-                            Some(wasmer_toml::Bindings::Wit(wasmer_toml::WitBindings {
-                                wit_exports: e.path().to_path_buf(),
-                                wit_bindgen: semver::Version::parse("0.1.0").unwrap(),
-                            }))
+                            Some(wasmer_config::package::Bindings::Wit(
+                                wasmer_config::package::WitBindings {
+                                    wit_exports: e.path().to_path_buf(),
+                                    wit_bindgen: semver::Version::parse("0.1.0").unwrap(),
+                                },
+                            ))
                         } else if is_wai {
-                            Some(wasmer_toml::Bindings::Wai(wasmer_toml::WaiBindings {
-                                exports: None,
-                                imports: vec![e.path().to_path_buf()],
-                                wai_version: semver::Version::parse("0.2.0").unwrap(),
-                            }))
+                            Some(wasmer_config::package::Bindings::Wai(
+                                wasmer_config::package::WaiBindings {
+                                    exports: None,
+                                    imports: vec![e.path().to_path_buf()],
+                                    wai_version: semver::Version::parse("0.2.0").unwrap(),
+                                },
+                            ))
                         } else {
                             None
                         }
@@ -322,12 +341,12 @@ impl Init {
 }
 
 enum GetBindingsResult {
-    OneBinding(wasmer_toml::Bindings),
-    MultiBindings(Vec<wasmer_toml::Bindings>),
+    OneBinding(wasmer_config::package::Bindings),
+    MultiBindings(Vec<wasmer_config::package::Bindings>),
 }
 
 impl GetBindingsResult {
-    fn first_binding(&self) -> Option<wasmer_toml::Bindings> {
+    fn first_binding(&self) -> Option<wasmer_config::package::Bindings> {
         match self {
             Self::OneBinding(s) => Some(s.clone()),
             Self::MultiBindings(s) => s.get(0).cloned(),
@@ -348,7 +367,8 @@ fn construct_manifest(
     template: Option<&Template>,
     include_fs: &[String],
     quiet: bool,
-) -> Result<wasmer_toml::Manifest, anyhow::Error> {
+    wasmer_dir: &Path,
+) -> Result<wasmer_config::package::Manifest, anyhow::Error> {
     if let Some(ct) = cargo_toml.as_ref() {
         let msg = format!(
             "NOTE: Initializing wasmer.toml file with metadata from Cargo.toml{NEWLINE}  -> {}",
@@ -366,9 +386,8 @@ fn construct_manifest(
             .map(|p| &p.name)
             .unwrap_or(fallback_package_name)
     });
-    let wasmer_dir = WasmerConfig::get_wasmer_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
     let namespace = namespace.or_else(|| {
-        wasmer_registry::whoami(&wasmer_dir, None, None)
+        wasmer_registry::whoami(wasmer_dir, None, None)
             .ok()
             .map(|o| o.1)
     });
@@ -388,17 +407,17 @@ fn construct_manifest(
         .and_then(|t| t.description.clone())
         .unwrap_or_else(|| format!("Description for package {package_name}"));
 
-    let default_abi = wasmer_toml::Abi::Wasi;
+    let default_abi = wasmer_config::package::Abi::Wasi;
     let bindings = Init::get_bindings(target_file, bin_or_lib);
 
     if let Some(GetBindingsResult::MultiBindings(m)) = bindings.as_ref() {
         let found = m
             .iter()
             .map(|m| match m {
-                wasmer_toml::Bindings::Wit(wb) => {
+                wasmer_config::package::Bindings::Wit(wb) => {
                     format!("found: {}", serde_json::to_string(wb).unwrap_or_default())
                 }
-                wasmer_toml::Bindings::Wai(wb) => {
+                wasmer_config::package::Bindings::Wai(wb) => {
                     format!("found: {}", serde_json::to_string(wb).unwrap_or_default())
                 }
             })
@@ -426,7 +445,7 @@ fn construct_manifest(
             let outpath = p
                 .build_dir
                 .join("release")
-                .join(&format!("{package_name}.wasm"));
+                .join(format!("{package_name}.wasm"));
             let canonicalized_outpath = outpath.canonicalize().unwrap_or(outpath);
             let outpath_str =
                 crate::common::normalize_path(&canonicalized_outpath.display().to_string());
@@ -448,7 +467,7 @@ fn construct_manifest(
         })
         .unwrap_or_else(|| Path::new(&format!("{package_name}.wasm")).to_path_buf());
 
-    let modules = vec![wasmer_toml::Module {
+    let modules = vec![wasmer_config::package::Module {
         name: package_name.to_string(),
         source: module_source,
         kind: None,
@@ -461,40 +480,51 @@ fn construct_manifest(
         }),
     }];
 
-    Ok(wasmer_toml::Manifest {
-        package: wasmer_toml::Package {
-            name: if let Some(s) = namespace {
-                format!("{s}/{package_name}")
-            } else {
-                package_name.to_string()
-            },
-            version,
-            description,
-            license,
-            license_file,
-            readme,
-            repository,
-            homepage,
-            wasmer_extra_flags: None,
-            disable_command_rename: false,
-            rename_commands_to_raw_command_name: false,
+    let mut pkg = wasmer_config::package::Package::builder(
+        if let Some(s) = namespace {
+            format!("{s}/{package_name}")
+        } else {
+            package_name.to_string()
         },
-        dependencies: Some(Init::get_dependencies(template)),
-        command: Init::get_command(&modules, bin_or_lib),
-        module: match bin_or_lib {
-            BinOrLib::Empty => None,
-            _ => Some(modules),
-        },
-        fs: Init::get_filesystem_mapping(include_fs),
-        base_directory_path: target_file
-            .parent()
-            .map(|o| o.to_path_buf())
-            .unwrap_or_else(|| target_file.to_path_buf()),
-    })
+        version,
+        description,
+    );
+
+    if let Some(license) = license {
+        pkg.license(license);
+    }
+    if let Some(license_file) = license_file {
+        pkg.license_file(license_file);
+    }
+    if let Some(readme) = readme {
+        pkg.readme(readme);
+    }
+    if let Some(repository) = repository {
+        pkg.repository(repository);
+    }
+    if let Some(homepage) = homepage {
+        pkg.homepage(homepage);
+    }
+    let pkg = pkg.build()?;
+
+    let mut manifest = wasmer_config::package::Manifest::builder(pkg);
+    manifest
+        .dependencies(Init::get_dependencies(template))
+        .commands(Init::get_command(&modules, bin_or_lib))
+        .fs(Init::get_filesystem_mapping(include_fs).collect());
+    match bin_or_lib {
+        BinOrLib::Bin | BinOrLib::Lib => {
+            manifest.modules(modules);
+        }
+        BinOrLib::Empty => {}
+    }
+    let manifest = manifest.build()?;
+
+    Ok(manifest)
 }
 fn parse_cargo_toml(manifest_path: &PathBuf) -> Result<MiniCargoTomlPackage, anyhow::Error> {
     let mut metadata = MetadataCommand::new();
-    metadata.manifest_path(&manifest_path);
+    metadata.manifest_path(manifest_path);
     metadata.no_deps();
     metadata.features(CargoOpt::AllFeatures);
 

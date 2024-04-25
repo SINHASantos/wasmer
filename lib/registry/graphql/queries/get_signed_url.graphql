@@ -1,5 +1,15 @@
-query GetSignedUrl ($name:String!, $version:String!,$expiresAfterSeconds:Int) {
-    url: getSignedUrlForPackageUpload(name:$name, version:$version,expiresAfterSeconds:$expiresAfterSeconds) {
-        url
-    }
+query GetSignedUrl(
+  $name: String
+  $version: String
+  $filename: String
+  $expiresAfterSeconds: Int
+) {
+  url: getSignedUrlForPackageUpload(
+    name: $name
+    version: $version
+	filename: $filename
+    expiresAfterSeconds: $expiresAfterSeconds
+  ) {
+    url
+  }
 }

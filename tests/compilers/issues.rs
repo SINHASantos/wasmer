@@ -265,6 +265,26 @@ fn regression_gpr_exhaustion_for_calls(mut config: crate::Config) -> Result<()> 
 }
 
 #[compiler_test(issues)]
+fn test_start(mut config: crate::Config) -> Result<()> {
+    let mut store = config.store();
+    let mut env = FunctionEnv::new(&mut store, ());
+    let imports: Imports = imports! {};
+    let wat = r#"
+    (module (func $main (unreachable)) (start $main))
+    "#;
+    let module = Module::new(&store, wat)?;
+    let instance = Instance::new(&mut store, &module, &imports);
+    assert!(instance.is_err());
+    if let InstantiationError::Start(err) = instance.unwrap_err() {
+        assert_eq!(err.message(), "unreachable");
+    } else {
+        panic!("_start should have failed with an unreachable error")
+    }
+
+    Ok(())
+}
+
+#[compiler_test(issues)]
 fn test_popcnt(mut config: crate::Config) -> Result<()> {
     let mut store = config.store();
     let mut env = FunctionEnv::new(&mut store, ());
@@ -420,5 +440,22 @@ fn large_number_local(mut config: crate::Config) -> Result<()> {
         .call(&mut store, &[])
         .unwrap();
     assert_eq!(&Value::I64(1_i64), result.get(0).unwrap());
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[compiler_test(issues)]
+/// Singlepass panics on aarch64 for long relocations.
+///
+/// Note: this one is specific to Singlepass, but we want to test in all
+/// available compilers.
+///
+/// https://github.com/wasmerio/wasmer/issues/4519
+fn issue_4519(mut config: crate::Config) -> Result<()> {
+    let wasm = include_bytes!("./data/4519_singlepass_panic.wasm");
+
+    let mut store = config.store();
+    let module = Module::new(&store, wasm)?;
+
     Ok(())
 }

@@ -1,3 +1,14 @@
+use dynasmrt::{aarch64::Aarch64Relocation, VecAssembler};
+#[cfg(feature = "unwind")]
+use gimli::{write::CallFrameInstruction, AArch64};
+
+use wasmer_compiler::wasmparser::ValType as WpType;
+use wasmer_types::{
+    CallingConvention, CompileError, CpuFeature, CustomSection, FunctionBody, FunctionIndex,
+    FunctionType, InstructionAddressMap, Relocation, RelocationKind, RelocationTarget, SourceLoc,
+    Target, TrapCode, TrapInformation, VMOffsets,
+};
+
 use crate::arm64_decl::new_machine_state;
 use crate::arm64_decl::{GPR, NEON};
 use crate::codegen_error;
@@ -7,15 +18,6 @@ use crate::location::Location as AbstractLocation;
 use crate::location::Reg;
 use crate::machine::*;
 use crate::unwind::{UnwindInstructions, UnwindOps};
-use dynasmrt::{aarch64::Aarch64Relocation, VecAssembler};
-#[cfg(feature = "unwind")]
-use gimli::{write::CallFrameInstruction, AArch64};
-use wasmer_compiler::wasmparser::Type as WpType;
-use wasmer_types::{
-    CallingConvention, CompileError, CustomSection, FunctionBody, FunctionIndex, FunctionType,
-    InstructionAddressMap, Relocation, RelocationKind, RelocationTarget, SourceLoc, TrapCode,
-    TrapInformation, VMOffsets,
-};
 
 type Assembler = VecAssembler<Aarch64Relocation>;
 type Location = AbstractLocation<GPR, NEON>;
@@ -103,7 +105,6 @@ pub struct MachineARM64 {
     used_simd: u32,
     trap_table: TrapTable,
     /// Map from byte offset into wasm function to range of native instructions.
-    ///
     // Ordered by increasing InstructionAddressMap::srcloc.
     instructions_address_map: Vec<InstructionAddressMap>,
     /// The source location for the current operator.
@@ -112,6 +113,8 @@ pub struct MachineARM64 {
     pushed: bool,
     /// Vector of unwind operations with offset
     unwind_ops: Vec<(usize, UnwindOps)>,
+    /// A boolean flag signaling if this machine supports NEON.
+    has_neon: bool,
 }
 
 #[allow(dead_code)]
@@ -136,7 +139,15 @@ enum ImmType {
 
 #[allow(dead_code)]
 impl MachineARM64 {
-    pub fn new() -> Self {
+    pub fn new(target: Option<Target>) -> Self {
+        // If and when needed, checks for other supported features should be
+        // added as boolean fields in the struct to make checking if such
+        // features are available as cheap as possible.
+        let has_neon = match target {
+            Some(ref target) => target.cpu_features().contains(CpuFeature::NEON),
+            None => false,
+        };
+
         MachineARM64 {
             assembler: Assembler::new(0),
             used_gprs: 0,
@@ -146,6 +157,7 @@ impl MachineARM64 {
             src_loc: 0,
             pushed: false,
             unwind_ops: vec![],
+            has_neon,
         }
     }
     fn compatible_imm(&self, imm: i64, ty: ImmType) -> bool {
@@ -960,7 +972,7 @@ impl MachineARM64 {
     fn memory_op<F: FnOnce(&mut Self, GPR) -> Result<(), CompileError>>(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         check_alignment: bool,
         value_size: usize,
         need_check: bool,
@@ -1120,7 +1132,7 @@ impl MachineARM64 {
         _loc: Location,
         _target: Location,
         _ret: Location,
-        _memarg: &MemoryImmediate,
+        _memarg: &MemArg,
         _value_size: usize,
         _memory_sz: Size,
         _stack_sz: Size,
@@ -2087,8 +2099,24 @@ impl Machine for MachineARM64 {
                 self.assembler.emit_mov(size_val, source, dst)?;
                 dst
             }
+            (Size::S8, false, Location::GPR(_)) => {
+                self.assembler.emit_uxtb(size_op, source, dst)?;
+                dst
+            }
+            (Size::S16, false, Location::GPR(_)) => {
+                self.assembler.emit_uxth(size_op, source, dst)?;
+                dst
+            }
+            (Size::S8, true, Location::GPR(_)) => {
+                self.assembler.emit_sxtb(size_op, source, dst)?;
+                dst
+            }
+            (Size::S16, true, Location::GPR(_)) => {
+                self.assembler.emit_sxth(size_op, source, dst)?;
+                dst
+            }
             (Size::S32, true, Location::GPR(_)) => {
-                self.assembler.emit_sxtw(size_val, source, dst)?;
+                self.assembler.emit_sxtw(size_op, source, dst)?;
                 dst
             }
             (Size::S32, false, Location::Memory(_, _)) => {
@@ -2097,6 +2125,22 @@ impl Machine for MachineARM64 {
             }
             (Size::S32, true, Location::Memory(_, _)) => {
                 self.emit_relaxed_ldr32s(size_op, dst, source)?;
+                dst
+            }
+            (Size::S16, false, Location::Memory(_, _)) => {
+                self.emit_relaxed_ldr16(size_op, dst, source)?;
+                dst
+            }
+            (Size::S16, true, Location::Memory(_, _)) => {
+                self.emit_relaxed_ldr16s(size_op, dst, source)?;
+                dst
+            }
+            (Size::S8, false, Location::Memory(_, _)) => {
+                self.emit_relaxed_ldr8(size_op, dst, source)?;
+                dst
+            }
+            (Size::S8, true, Location::Memory(_, _)) => {
+                self.emit_relaxed_ldr8s(size_op, dst, source)?;
                 dst
             }
             _ => codegen_error!(
@@ -2256,8 +2300,10 @@ impl Machine for MachineARM64 {
     }
 
     // assembler finalize
-    fn assembler_finalize(self) -> Vec<u8> {
-        self.assembler.finalize().unwrap()
+    fn assembler_finalize(self) -> Result<Vec<u8>, CompileError> {
+        self.assembler.finalize().map_err(|e| {
+            CompileError::Codegen(format!("Assembler failed finalization with: {:?}", e))
+        })
     }
 
     fn get_offset(&self) -> Offset {
@@ -2764,7 +2810,7 @@ impl Machine for MachineARM64 {
         let dest = self.location_to_reg(Size::S32, ret, &mut temps, ImmType::None, false, None)?;
 
         self.assembler
-            .emit_cbz_label(Size::S32, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S32, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_udiv(Size::S32, src1, src2, dest)?;
         if ret != dest {
@@ -2789,7 +2835,7 @@ impl Machine for MachineARM64 {
         let dest = self.location_to_reg(Size::S32, ret, &mut temps, ImmType::None, false, None)?;
 
         self.assembler
-            .emit_cbz_label(Size::S32, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S32, src2, integer_division_by_zero)?;
         let label_nooverflow = self.assembler.get_label();
         let tmp = self.location_to_reg(
             Size::S32,
@@ -2841,7 +2887,7 @@ impl Machine for MachineARM64 {
             dest
         };
         self.assembler
-            .emit_cbz_label(Size::S32, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S32, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_udiv(Size::S32, src1, src2, dest)?;
         // unsigned remainder : src1 - (src1/src2)*src2
@@ -2879,7 +2925,7 @@ impl Machine for MachineARM64 {
             dest
         };
         self.assembler
-            .emit_cbz_label(Size::S32, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S32, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_sdiv(Size::S32, src1, src2, dest)?;
         // unsigned remainder : src1 - (src1/src2)*src2
@@ -3036,48 +3082,82 @@ impl Machine for MachineARM64 {
         Ok(())
     }
     fn i32_popcnt(&mut self, loc: Location, ret: Location) -> Result<(), CompileError> {
-        // no opcode for that.
-        // 2 solutions: using NEON CNT, that count bits per Byte, or using clz with some shift and loop
-        let mut temps = vec![];
-        let src = self.location_to_reg(Size::S32, loc, &mut temps, ImmType::None, true, None)?;
-        let dest = self.location_to_reg(Size::S32, ret, &mut temps, ImmType::None, false, None)?;
-        let src = if src == loc {
-            let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+        if self.has_neon {
+            let mut temps = vec![];
+
+            let src_gpr =
+                self.location_to_reg(Size::S32, loc, &mut temps, ImmType::None, true, None)?;
+            let dst_gpr =
+                self.location_to_reg(Size::S32, ret, &mut temps, ImmType::None, false, None)?;
+
+            let mut neon_temps = vec![];
+            let neon_temp = self.acquire_temp_simd().ok_or_else(|| {
                 CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
             })?;
-            temps.push(tmp);
+            neon_temps.push(neon_temp);
+
             self.assembler
-                .emit_mov(Size::S32, src, Location::GPR(tmp))?;
-            Location::GPR(tmp)
+                .emit_fmov(Size::S32, src_gpr, Size::S32, Location::SIMD(neon_temp))?;
+            self.assembler.emit_cnt(neon_temp, neon_temp)?;
+            self.assembler.emit_addv(neon_temp, neon_temp)?;
+            self.assembler
+                .emit_fmov(Size::S32, Location::SIMD(neon_temp), Size::S32, dst_gpr)?;
+
+            if ret != dst_gpr {
+                self.move_location(Size::S32, dst_gpr, ret)?;
+            }
+
+            for r in temps {
+                self.release_gpr(r);
+            }
+
+            for r in neon_temps {
+                self.release_simd(r);
+            }
         } else {
-            src
-        };
-        let tmp = {
-            let tmp = self.acquire_temp_gpr().ok_or_else(|| {
-                CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
-            })?;
-            temps.push(tmp);
-            Location::GPR(tmp)
-        };
-        let label_loop = self.assembler.get_label();
-        let label_exit = self.assembler.get_label();
-        self.assembler
-            .emit_mov(Size::S32, Location::GPR(GPR::XzrSp), dest)?; // 0 => dest
-        self.assembler.emit_cbz_label(Size::S32, src, label_exit)?; // src==0, exit
-        self.assembler.emit_label(label_loop)?; // loop:
-        self.assembler
-            .emit_add(Size::S32, dest, Location::Imm8(1), dest)?; // dest += 1
-        self.assembler.emit_clz(Size::S32, src, tmp)?; // clz src => tmp
-        self.assembler.emit_lsl(Size::S32, src, tmp, src)?; // src << tmp => src
-        self.assembler
-            .emit_lsl(Size::S32, src, Location::Imm8(1), src)?; // src << 1 => src
-        self.assembler.emit_cbnz_label(Size::S32, src, label_loop)?; // if src!=0 goto loop
-        self.assembler.emit_label(label_exit)?;
-        if ret != dest {
-            self.move_location(Size::S32, dest, ret)?;
-        }
-        for r in temps {
-            self.release_gpr(r);
+            let mut temps = vec![];
+            let src =
+                self.location_to_reg(Size::S32, loc, &mut temps, ImmType::None, true, None)?;
+            let dest =
+                self.location_to_reg(Size::S32, ret, &mut temps, ImmType::None, false, None)?;
+            let src = if src == loc {
+                let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
+                })?;
+                temps.push(tmp);
+                self.assembler
+                    .emit_mov(Size::S32, src, Location::GPR(tmp))?;
+                Location::GPR(tmp)
+            } else {
+                src
+            };
+            let tmp = {
+                let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
+                })?;
+                temps.push(tmp);
+                Location::GPR(tmp)
+            };
+            let label_loop = self.assembler.get_label();
+            let label_exit = self.assembler.get_label();
+            self.assembler
+                .emit_mov(Size::S32, Location::GPR(GPR::XzrSp), dest)?; // 0 => dest
+            self.assembler.emit_cbz_label(Size::S32, src, label_exit)?; // src==0, exit
+            self.assembler.emit_label(label_loop)?; // loop:
+            self.assembler
+                .emit_add(Size::S32, dest, Location::Imm8(1), dest)?; // dest += 1
+            self.assembler.emit_clz(Size::S32, src, tmp)?; // clz src => tmp
+            self.assembler.emit_lsl(Size::S32, src, tmp, src)?; // src << tmp => src
+            self.assembler
+                .emit_lsl(Size::S32, src, Location::Imm8(1), src)?; // src << 1 => src
+            self.assembler.emit_cbnz_label(Size::S32, src, label_loop)?; // if src!=0 goto loop
+            self.assembler.emit_label(label_exit)?;
+            if ret != dest {
+                self.move_location(Size::S32, dest, ret)?;
+            }
+            for r in temps {
+                self.release_gpr(r);
+            }
         }
         Ok(())
     }
@@ -3183,7 +3263,7 @@ impl Machine for MachineARM64 {
     fn i32_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3207,7 +3287,7 @@ impl Machine for MachineARM64 {
     fn i32_load_8u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3231,7 +3311,7 @@ impl Machine for MachineARM64 {
     fn i32_load_8s(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3255,7 +3335,7 @@ impl Machine for MachineARM64 {
     fn i32_load_16u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3279,7 +3359,7 @@ impl Machine for MachineARM64 {
     fn i32_load_16s(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3303,7 +3383,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3327,7 +3407,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_load_8u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3351,7 +3431,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_load_16u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3375,7 +3455,7 @@ impl Machine for MachineARM64 {
     fn i32_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3399,7 +3479,7 @@ impl Machine for MachineARM64 {
     fn i32_save_8(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3423,7 +3503,7 @@ impl Machine for MachineARM64 {
     fn i32_save_16(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3447,7 +3527,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3472,7 +3552,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_save_8(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3497,7 +3577,7 @@ impl Machine for MachineARM64 {
     fn i32_atomic_save_16(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3524,7 +3604,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3574,6 +3654,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3583,7 +3665,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3633,6 +3715,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3642,7 +3726,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3692,6 +3776,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3701,7 +3787,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3751,6 +3837,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3760,7 +3848,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3810,6 +3898,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3819,7 +3909,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3869,6 +3959,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3878,7 +3970,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3928,6 +4020,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3937,7 +4031,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -3987,6 +4081,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -3996,7 +4092,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4046,6 +4142,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4055,7 +4153,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4105,6 +4203,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4114,7 +4214,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4164,6 +4264,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4173,7 +4275,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4223,6 +4325,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4232,7 +4336,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4282,6 +4386,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4291,7 +4397,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4341,6 +4447,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4350,7 +4458,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4400,6 +4508,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -4409,7 +4519,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4457,6 +4567,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -4466,7 +4577,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4514,6 +4625,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -4523,7 +4635,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4571,6 +4683,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -4581,7 +4694,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4633,6 +4746,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -4643,7 +4757,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4695,6 +4809,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -4705,7 +4820,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -4757,6 +4872,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -5112,47 +5228,84 @@ impl Machine for MachineARM64 {
         Ok(())
     }
     fn i64_popcnt(&mut self, loc: Location, ret: Location) -> Result<(), CompileError> {
-        let mut temps = vec![];
-        let src = self.location_to_reg(Size::S64, loc, &mut temps, ImmType::None, true, None)?;
-        let dest = self.location_to_reg(Size::S64, ret, &mut temps, ImmType::None, false, None)?;
-        let src = if src == loc {
-            let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+        if self.has_neon {
+            let mut temps = vec![];
+
+            let src_gpr =
+                self.location_to_reg(Size::S64, loc, &mut temps, ImmType::None, true, None)?;
+            let dst_gpr =
+                self.location_to_reg(Size::S64, ret, &mut temps, ImmType::None, false, None)?;
+
+            let mut neon_temps = vec![];
+            let neon_temp = self.acquire_temp_simd().ok_or_else(|| {
                 CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
             })?;
-            temps.push(tmp);
+            neon_temps.push(neon_temp);
+
             self.assembler
-                .emit_mov(Size::S64, src, Location::GPR(tmp))?;
-            Location::GPR(tmp)
+                .emit_fmov(Size::S64, src_gpr, Size::S64, Location::SIMD(neon_temp))?;
+            self.assembler.emit_cnt(neon_temp, neon_temp)?;
+            self.assembler.emit_addv(neon_temp, neon_temp)?;
+            self.assembler
+                .emit_fmov(Size::S64, Location::SIMD(neon_temp), Size::S64, dst_gpr)?;
+
+            if ret != dst_gpr {
+                self.move_location(Size::S64, dst_gpr, ret)?;
+            }
+
+            for r in temps {
+                self.release_gpr(r);
+            }
+
+            for r in neon_temps {
+                self.release_simd(r);
+            }
         } else {
-            src
-        };
-        let tmp = {
-            let tmp = self.acquire_temp_gpr().ok_or_else(|| {
-                CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
-            })?;
-            temps.push(tmp);
-            Location::GPR(tmp)
-        };
-        let label_loop = self.assembler.get_label();
-        let label_exit = self.assembler.get_label();
-        self.assembler
-            .emit_mov(Size::S32, Location::GPR(GPR::XzrSp), dest)?; // dest <= 0
-        self.assembler.emit_cbz_label(Size::S64, src, label_exit)?; // src == 0, then goto label_exit
-        self.assembler.emit_label(label_loop)?;
-        self.assembler
-            .emit_add(Size::S32, dest, Location::Imm8(1), dest)?; // dest += 1
-        self.assembler.emit_clz(Size::S64, src, tmp)?; // clz src => tmp
-        self.assembler.emit_lsl(Size::S64, src, tmp, src)?; // src << tmp => src
-        self.assembler
-            .emit_lsl(Size::S64, src, Location::Imm8(1), src)?; // src << 1 => src
-        self.assembler.emit_cbnz_label(Size::S64, src, label_loop)?; // src != 0, then goto label_loop
-        self.assembler.emit_label(label_exit)?;
-        if ret != dest {
-            self.move_location(Size::S64, dest, ret)?;
+            let mut temps = vec![];
+            let src =
+                self.location_to_reg(Size::S64, loc, &mut temps, ImmType::None, true, None)?;
+            let dest =
+                self.location_to_reg(Size::S64, ret, &mut temps, ImmType::None, false, None)?;
+            let src = if src == loc {
+                let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
+                })?;
+                temps.push(tmp);
+                self.assembler
+                    .emit_mov(Size::S64, src, Location::GPR(tmp))?;
+                Location::GPR(tmp)
+            } else {
+                src
+            };
+            let tmp = {
+                let tmp = self.acquire_temp_gpr().ok_or_else(|| {
+                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
+                })?;
+                temps.push(tmp);
+                Location::GPR(tmp)
+            };
+            let label_loop = self.assembler.get_label();
+            let label_exit = self.assembler.get_label();
+            self.assembler
+                .emit_mov(Size::S32, Location::GPR(GPR::XzrSp), dest)?; // dest <= 0
+            self.assembler.emit_cbz_label(Size::S64, src, label_exit)?; // src == 0, then goto label_exit
+            self.assembler.emit_label(label_loop)?;
+            self.assembler
+                .emit_add(Size::S32, dest, Location::Imm8(1), dest)?; // dest += 1
+            self.assembler.emit_clz(Size::S64, src, tmp)?; // clz src => tmp
+            self.assembler.emit_lsl(Size::S64, src, tmp, src)?; // src << tmp => src
+            self.assembler
+                .emit_lsl(Size::S64, src, Location::Imm8(1), src)?; // src << 1 => src
+            self.assembler.emit_cbnz_label(Size::S64, src, label_loop)?; // src != 0, then goto label_loop
+            self.assembler.emit_label(label_exit)?;
+            if ret != dest {
+                self.move_location(Size::S64, dest, ret)?;
+            }
+            for r in temps {
+                self.release_gpr(r);
+            }
         }
-        for r in temps {
-            self.release_gpr(r);
-        }
+
         Ok(())
     }
     fn i64_shl(
@@ -5258,7 +5411,7 @@ impl Machine for MachineARM64 {
     fn i64_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5282,7 +5435,7 @@ impl Machine for MachineARM64 {
     fn i64_load_8u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5306,7 +5459,7 @@ impl Machine for MachineARM64 {
     fn i64_load_8s(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5330,7 +5483,7 @@ impl Machine for MachineARM64 {
     fn i64_load_16u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5354,7 +5507,7 @@ impl Machine for MachineARM64 {
     fn i64_load_16s(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5378,7 +5531,7 @@ impl Machine for MachineARM64 {
     fn i64_load_32u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5402,7 +5555,7 @@ impl Machine for MachineARM64 {
     fn i64_load_32s(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5426,7 +5579,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5450,7 +5603,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_load_8u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5474,7 +5627,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_load_16u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5498,7 +5651,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_load_32u(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5522,7 +5675,7 @@ impl Machine for MachineARM64 {
     fn i64_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5546,7 +5699,7 @@ impl Machine for MachineARM64 {
     fn i64_save_8(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5570,7 +5723,7 @@ impl Machine for MachineARM64 {
     fn i64_save_16(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5594,7 +5747,7 @@ impl Machine for MachineARM64 {
     fn i64_save_32(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5618,7 +5771,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5643,7 +5796,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_save_8(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5668,7 +5821,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_save_16(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5693,7 +5846,7 @@ impl Machine for MachineARM64 {
     fn i64_atomic_save_32(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5720,7 +5873,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5770,6 +5923,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -5779,7 +5934,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5829,6 +5984,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -5838,7 +5995,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5888,6 +6045,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -5897,7 +6056,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -5947,6 +6106,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -5956,7 +6117,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6006,6 +6167,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6015,7 +6178,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6065,6 +6228,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6074,7 +6239,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6124,6 +6289,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6133,7 +6300,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6183,6 +6350,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6192,7 +6361,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6242,6 +6411,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6251,7 +6422,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6301,6 +6472,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6310,7 +6483,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6360,6 +6533,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6369,7 +6544,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6419,6 +6594,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6428,7 +6605,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6478,6 +6655,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6487,7 +6666,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6537,6 +6716,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6546,7 +6727,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6596,6 +6777,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6605,7 +6788,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6655,6 +6838,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6664,7 +6849,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6714,6 +6899,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6723,7 +6910,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6773,6 +6960,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6782,7 +6971,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6832,6 +7021,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6841,7 +7032,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6891,6 +7082,8 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp1);
+                this.release_gpr(tmp2);
                 Ok(())
             },
         )
@@ -6900,7 +7093,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -6948,6 +7141,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -6957,7 +7151,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7005,6 +7199,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7014,7 +7209,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7062,6 +7257,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7071,7 +7267,7 @@ impl Machine for MachineARM64 {
         &mut self,
         loc: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7119,6 +7315,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7129,7 +7326,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7181,6 +7378,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7191,7 +7389,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7243,6 +7441,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7253,7 +7452,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7305,6 +7504,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7315,7 +7515,7 @@ impl Machine for MachineARM64 {
         new: Location,
         cmp: Location,
         target: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7367,6 +7567,7 @@ impl Machine for MachineARM64 {
                 for r in temps {
                     this.release_gpr(r);
                 }
+                this.release_gpr(tmp);
                 Ok(())
             },
         )
@@ -7375,7 +7576,7 @@ impl Machine for MachineARM64 {
     fn f32_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7399,7 +7600,7 @@ impl Machine for MachineARM64 {
     fn f32_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         canonicalize: bool,
         need_check: bool,
@@ -7431,7 +7632,7 @@ impl Machine for MachineARM64 {
     fn f64_load(
         &mut self,
         addr: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         ret: Location,
         need_check: bool,
         imported_memories: bool,
@@ -7455,7 +7656,7 @@ impl Machine for MachineARM64 {
     fn f64_save(
         &mut self,
         target_value: Location,
-        memarg: &MemoryImmediate,
+        memarg: &MemArg,
         target_addr: Location,
         canonicalize: bool,
         need_check: bool,
@@ -8366,5 +8567,331 @@ impl Machine for MachineARM64 {
 
     fn gen_windows_unwind_info(&mut self, _code_len: usize) -> Option<Vec<u8>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn test_move_location(machine: &mut MachineARM64, size: Size) -> Result<(), CompileError> {
+        machine.move_location(size, Location::GPR(GPR::X1), Location::GPR(GPR::X2))?;
+        machine.move_location(size, Location::GPR(GPR::X1), Location::Memory(GPR::X2, 10))?;
+        machine.move_location(size, Location::GPR(GPR::X1), Location::Memory(GPR::X2, -10))?;
+        machine.move_location(
+            size,
+            Location::GPR(GPR::X1),
+            Location::Memory(GPR::X2, 1024),
+        )?;
+        machine.move_location(
+            size,
+            Location::GPR(GPR::X1),
+            Location::Memory(GPR::X2, -1024),
+        )?;
+        machine.move_location(size, Location::Memory(GPR::X2, 10), Location::GPR(GPR::X1))?;
+        machine.move_location(size, Location::Memory(GPR::X2, -10), Location::GPR(GPR::X1))?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, 1024),
+            Location::GPR(GPR::X1),
+        )?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, -1024),
+            Location::GPR(GPR::X1),
+        )?;
+        machine.move_location(size, Location::GPR(GPR::X1), Location::SIMD(NEON::V0))?;
+        machine.move_location(size, Location::SIMD(NEON::V0), Location::GPR(GPR::X1))?;
+        machine.move_location(
+            size,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X2, 10),
+        )?;
+        machine.move_location(
+            size,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X2, -10),
+        )?;
+        machine.move_location(
+            size,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X2, 1024),
+        )?;
+        machine.move_location(
+            size,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X2, -1024),
+        )?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, 10),
+            Location::SIMD(NEON::V0),
+        )?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, -10),
+            Location::SIMD(NEON::V0),
+        )?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, 1024),
+            Location::SIMD(NEON::V0),
+        )?;
+        machine.move_location(
+            size,
+            Location::Memory(GPR::X2, -1024),
+            Location::SIMD(NEON::V0),
+        )?;
+
+        Ok(())
+    }
+
+    fn test_move_location_extended(
+        machine: &mut MachineARM64,
+        signed: bool,
+        sized: Size,
+    ) -> Result<(), CompileError> {
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::GPR(GPR::X1),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::Memory(GPR::X1, 10),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::Memory(GPR::X1, 16),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::Memory(GPR::X1, -16),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::Memory(GPR::X1, 1024),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::GPR(GPR::X0),
+            Size::S64,
+            Location::Memory(GPR::X1, -1024),
+        )?;
+        machine.move_location_extend(
+            sized,
+            signed,
+            Location::Memory(GPR::X0, 10),
+            Size::S64,
+            Location::GPR(GPR::X1),
+        )?;
+
+        Ok(())
+    }
+
+    fn test_binop_op(
+        machine: &mut MachineARM64,
+        op: fn(&mut MachineARM64, Location, Location, Location) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        op(
+            machine,
+            Location::GPR(GPR::X2),
+            Location::GPR(GPR::X2),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::GPR(GPR::X2),
+            Location::Imm32(10),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::GPR(GPR::X0),
+            Location::GPR(GPR::X0),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::Imm32(10),
+            Location::GPR(GPR::X2),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::GPR(GPR::X0),
+            Location::GPR(GPR::X2),
+            Location::Memory(GPR::X0, 10),
+        )?;
+        op(
+            machine,
+            Location::GPR(GPR::X0),
+            Location::Memory(GPR::X2, 16),
+            Location::Memory(GPR::X0, 10),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X0, 0),
+            Location::Memory(GPR::X2, 16),
+            Location::Memory(GPR::X0, 10),
+        )?;
+
+        Ok(())
+    }
+
+    fn test_float_binop_op(
+        machine: &mut MachineARM64,
+        op: fn(&mut MachineARM64, Location, Location, Location) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        op(
+            machine,
+            Location::SIMD(NEON::V3),
+            Location::SIMD(NEON::V2),
+            Location::SIMD(NEON::V0),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V2),
+            Location::SIMD(NEON::V0),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X0, 0),
+            Location::SIMD(NEON::V2),
+            Location::SIMD(NEON::V0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X0, 0),
+            Location::Memory(GPR::X1, 10),
+            Location::SIMD(NEON::V0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X0, 0),
+            Location::Memory(GPR::X1, 16),
+            Location::Memory(GPR::X2, 32),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X1, 16),
+            Location::Memory(GPR::X2, 32),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V1),
+            Location::Memory(GPR::X2, 32),
+        )?;
+
+        Ok(())
+    }
+
+    fn test_float_cmp_op(
+        machine: &mut MachineARM64,
+        op: fn(&mut MachineARM64, Location, Location, Location) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        op(
+            machine,
+            Location::SIMD(NEON::V3),
+            Location::SIMD(NEON::V2),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V0),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X1, 0),
+            Location::SIMD(NEON::V2),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X1, 0),
+            Location::Memory(GPR::X2, 10),
+            Location::GPR(GPR::X0),
+        )?;
+        op(
+            machine,
+            Location::Memory(GPR::X1, 0),
+            Location::Memory(GPR::X2, 16),
+            Location::Memory(GPR::X0, 32),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::Memory(GPR::X2, 16),
+            Location::Memory(GPR::X0, 32),
+        )?;
+        op(
+            machine,
+            Location::SIMD(NEON::V0),
+            Location::SIMD(NEON::V1),
+            Location::Memory(GPR::X0, 32),
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn tests_arm64() -> Result<(), CompileError> {
+        let mut machine = MachineARM64::new(None);
+
+        test_move_location(&mut machine, Size::S32)?;
+        test_move_location(&mut machine, Size::S64)?;
+        test_move_location_extended(&mut machine, false, Size::S8)?;
+        test_move_location_extended(&mut machine, false, Size::S16)?;
+        test_move_location_extended(&mut machine, false, Size::S32)?;
+        test_move_location_extended(&mut machine, true, Size::S8)?;
+        test_move_location_extended(&mut machine, true, Size::S16)?;
+        test_move_location_extended(&mut machine, true, Size::S32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_add32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_add64)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_sub32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_sub64)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_and32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_and64)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_xor32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_xor64)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_or32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_or64)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_mul32)?;
+        test_binop_op(&mut machine, MachineARM64::emit_binop_mul64)?;
+        test_float_binop_op(&mut machine, MachineARM64::f32_add)?;
+        test_float_binop_op(&mut machine, MachineARM64::f32_sub)?;
+        test_float_binop_op(&mut machine, MachineARM64::f32_mul)?;
+        test_float_binop_op(&mut machine, MachineARM64::f32_div)?;
+        test_float_cmp_op(&mut machine, MachineARM64::f32_cmp_eq)?;
+        test_float_cmp_op(&mut machine, MachineARM64::f32_cmp_lt)?;
+        test_float_cmp_op(&mut machine, MachineARM64::f32_cmp_le)?;
+
+        Ok(())
     }
 }

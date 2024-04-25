@@ -4,19 +4,13 @@ expression: snapshot
 ---
 {
   "spec": {
-    "name": null,
-    "wasm_hash": "e124abdb35b6021a00ae6bf69dfba190",
+    "name": "snapshot::test_snapshot_cowsay",
     "use_packages": [],
+    "include_webcs": [],
     "cli_args": [],
-    "stdin": [
-      98,
-      108,
-      97,
-      104,
-      10
-    ],
-    "debug_output": false,
-    "enable_threads": true
+    "stdin_hash": "0d599f0ec05c3bda8c3b8a68c32a1b47",
+    "enable_threads": true,
+    "enable_network": false
   },
   "result": {
     "Success": {

@@ -1,30 +1,28 @@
 #![allow(dead_code)]
 //! Create a standalone native executable for a given Wasm file.
 
-use super::ObjectFormat;
-use crate::store::CompilerOptions;
+use std::{env, path::PathBuf};
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::env;
-
-use std::path::PathBuf;
-
 use wasmer::*;
+
+use crate::store::CompilerOptions;
 
 #[derive(Debug, Parser)]
 /// The options for the `wasmer create-exe` subcommand
 pub struct CreateObj {
     /// Input file
-    #[clap(name = "FILE", parse(from_os_str))]
+    #[clap(name = "FILE")]
     path: PathBuf,
 
     /// Output file or directory if the input is a pirita file
-    #[clap(name = "OUTPUT_PATH", short = 'o', parse(from_os_str))]
+    #[clap(name = "OUTPUT_PATH", short = 'o')]
     output: PathBuf,
 
     /// Optional directorey used for debugging: if present, will
     /// output the files to a debug instead of a temp directory
-    #[clap(long, name = "DEBUG PATH", parse(from_os_str))]
+    #[clap(long, name = "DEBUG PATH")]
     debug_dir: Option<PathBuf>,
 
     /// Prefix for the function names in the input file in the compiled object file.
@@ -52,15 +50,7 @@ pub struct CreateObj {
     #[clap(long = "target")]
     target_triple: Option<Triple>,
 
-    /// Object format options
-    ///
-    /// This flag accepts two options: `symbols` or `serialized`.
-    /// - (default) `symbols` creates an object where all functions and metadata of the module are regular object symbols
-    /// - `serialized` creates an object where the module is zero-copy serialized as raw data
-    #[clap(long = "object-format", name = "OBJECT_FORMAT", verbatim_doc_comment)]
-    object_format: Option<ObjectFormat>,
-
-    #[clap(long, short = 'm', multiple = true, number_of_values = 1)]
+    #[clap(long, short = 'm', number_of_values = 1)]
     cpu_features: Vec<CpuFeature>,
 
     #[clap(flatten)]
@@ -73,14 +63,13 @@ impl CreateObj {
         let path = crate::common::normalize_path(&format!("{}", self.path.display()));
         let target_triple = self.target_triple.clone().unwrap_or_else(Triple::host);
         let starting_cd = env::current_dir()?;
-        let input_path = starting_cd.join(&path);
+        let input_path = starting_cd.join(path);
         let temp_dir = tempfile::tempdir();
         let output_directory_path = match self.debug_dir.as_ref() {
             Some(s) => s.clone(),
             None => temp_dir?.path().to_path_buf(),
         };
         std::fs::create_dir_all(&output_directory_path)?;
-        let object_format = self.object_format.unwrap_or_default();
         let prefix = match self.prefix.as_ref() {
             Some(s) => vec![s.clone()],
             None => Vec::new(),
@@ -93,18 +82,14 @@ impl CreateObj {
         let (_, compiler_type) = self.compiler.get_store_for_target(target.clone())?;
         println!("Compiler: {}", compiler_type.to_string());
         println!("Target: {}", target.triple());
-        println!("Format: {:?}", object_format);
 
-        let atoms = if let Ok(pirita) =
-            webc::WebCMmap::parse(input_path.clone(), &webc::ParseOptions::default())
-        {
+        let atoms = if let Ok(webc) = webc::compat::Container::from_disk(&input_path) {
             crate::commands::create_exe::compile_pirita_into_directory(
-                &pirita,
+                &webc,
                 &output_directory_path,
                 &self.compiler,
                 &self.cpu_features,
                 &target_triple,
-                object_format,
                 &prefix,
                 crate::commands::AllowMultiWasm::Reject(self.atom.clone()),
                 self.debug_dir.is_some(),
@@ -116,7 +101,6 @@ impl CreateObj {
                 &self.compiler,
                 &target_triple,
                 &self.cpu_features,
-                object_format,
                 &prefix,
                 self.debug_dir.is_some(),
             )

@@ -63,7 +63,7 @@ pub enum ControlStackFrame {
         num_return_values: usize,
         original_stack_size: usize,
         exit_is_branched_to: bool,
-        blocktype: wasmer_compiler::wasmparser::TypeOrFuncType,
+        blocktype: wasmer_compiler::wasmparser::BlockType,
         /// Was the head of the `if` reachable?
         head_is_reachable: bool,
         /// What was the reachability at the end of the consequent?
@@ -343,7 +343,7 @@ impl FuncTranslationState {
         (v1, v2, v3)
     }
 
-    /// Helper to ensure the the stack size is at least as big as `n`; note that due to
+    /// Helper to ensure the stack size is at least as big as `n`; note that due to
     /// `debug_assert` this will not execute in non-optimized builds.
     #[inline]
     fn ensure_length_is_at_least(&self, n: usize) {
@@ -419,7 +419,7 @@ impl FuncTranslationState {
         else_data: ElseData,
         num_param_types: usize,
         num_result_types: usize,
-        blocktype: wasmer_compiler::wasmparser::TypeOrFuncType,
+        blocktype: wasmer_compiler::wasmparser::BlockType,
     ) {
         debug_assert!(num_param_types <= self.stack.len());
 
